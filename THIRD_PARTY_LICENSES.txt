@@ -1,0 +1,43 @@
+Third-Party Open-Source Software Notices for Bittec Flasher
+===========================================================
+
+Bittec Flasher incorporates or relies on the following open-source components:
+
+1. pymavlink
+   - License: GNU Lesser General Public License v3.0 (LGPL-3.0)
+   - Source: https://github.com/ArduPilot/pymavlink
+   - Note: Full source code of Bittec Flasher is published under GPL-3.0-or-later
+     at https://github.com/zloytarik/bittec-flasher, allowing any user to rebuild
+     the executable with a modified or updated version of pymavlink.
+
+2. uploader.py (PX4 / ArduPilot firmware uploader)
+   - License: BSD-3-Clause (distributed within ArduPilot under GPL-3.0-or-later)
+   - Source: https://github.com/ArduPilot/ardupilot/blob/master/Tools/scripts/uploader.py
+   - Copyright (c) 2012-2017 PX4 Development Team and ArduPilot contributors.
+
+3. pyserial
+   - License: BSD-3-Clause
+   - Source: https://github.com/pyserial/pyserial
+   - Copyright (c) 2001-2020 Chris Liechti.
+
+4. lxml
+   - License: BSD-3-Clause
+   - Source: https://github.com/lxml/lxml
+   - Copyright (c) 2004 Infrae.
+
+5. fastcrc
+   - License: MIT License
+   - Source: https://github.com/overfl0/fastcrc
+
+6. Python Standard Library & Tcl/Tk (tkinter)
+   - License: Python Software Foundation License (PSF-2.0) / Tcl/Tk License
+   - Source: https://www.python.org/
+
+7. PyInstaller (build tool / bootloader)
+   - License: GPL-2.0 with a special exception allowing packaging of binaries
+   - Source: https://github.com/pyinstaller/pyinstaller
+
+Trademark Notice:
+"ArduPilot" and "Pixhawk" are registered trademarks of their respective owners.
+Bittec Flasher is an independent utility developed by Bittec (https://bittec.com.ua)
+and is not affiliated with, endorsed by, or sponsored by the ArduPilot Project or Pixhawk.

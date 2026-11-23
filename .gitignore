@@ -1,0 +1,12 @@
+﻿*.apj
+*.bin
+*.param
+*.parm
+*_verify_report.txt
+*_removed.txt
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+.venv/
