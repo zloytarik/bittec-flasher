@@ -41,3 +41,18 @@ Trademark Notice:
 "ArduPilot" and "Pixhawk" are registered trademarks of their respective owners.
 Bittec Flasher is an independent utility developed by Bittec (https://bittec.com.ua)
 and is not affiliated with, endorsed by, or sponsored by the ArduPilot Project or Pixhawk.
+8. dfu-util (STM32 DFU firmware programmer)
+   - License: GNU General Public License v2.0 or later (GPL-2.0-or-later)
+   - Source: https://dfu-util.sourceforge.net/
+
+9. libusb
+   - License: GNU Lesser General Public License v2.1 or later (LGPL-2.1-or-later)
+   - Source: https://libusb.info/
+
+8. dfu-util (STM32 DFU firmware programmer)
+   - License: GNU General Public License v2.0 or later (GPL-2.0-or-later)
+   - Source: https://dfu-util.sourceforge.net/
+
+9. libusb
+   - License: GNU Lesser General Public License v2.1 or later (LGPL-2.1-or-later)
+   - Source: https://libusb.info/

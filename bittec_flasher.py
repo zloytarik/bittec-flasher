@@ -1,4 +1,5 @@
-# Bittec Flasher — Utility for flashing firmware and two-pass MAVLink parameter upload
+# Bittec Flasher — Utility for flashing firmware (.apj / STM32 DFU .hex/.bin)
+# and two-pass MAVLink parameter upload
 # Copyright (C) 2026 Bittec (https://bittec.com.ua)
 # Repository: https://github.com/zloytarik/bittec-flasher
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -16,9 +17,11 @@ import platform
 import queue
 import re
 import runpy
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -37,7 +40,7 @@ from pymavlink.dialects.v20 import ardupilotmega as _mav20  # noqa: E402, F401
 from pymavlink.dialects.v20 import common as _mav20_common  # noqa: E402, F401
 
 APP_NAME = "Bittec Flasher"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_COPYRIGHT = "© 2026 Bittec (https://bittec.com.ua)"
 APP_REPO = "https://github.com/zloytarik/bittec-flasher"
 
@@ -102,6 +105,20 @@ def _maybe_run_embedded_uploader():
         sys.exit(0)
 
 
+def find_dfu_util() -> Path | None:
+    candidates = [
+        RESOURCE_DIR / "dfu_bin" / "dfu-util.exe",
+        RESOURCE_DIR / "dfu-util.exe",
+        BASE_DIR / "dfu_bin" / "dfu-util.exe",
+        BASE_DIR / "dfu-util.exe",
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    found = shutil.which("dfu-util")
+    return Path(found) if found else None
+
+
 def find_default_file(folder: Path, patterns: tuple[str, ...], skip_suffix: str = "") -> str:
     for pat in patterns:
         for cand in sorted(folder.glob(pat)):
@@ -116,15 +133,110 @@ def norm_param_id(pid) -> str:
     return str(pid).rstrip("\x00")
 
 
+def is_secondary_iface(port_info) -> bool:
+    desc = f"{port_info.description or ''} {getattr(port_info, 'interface', None) or ''}".lower()
+    hwid = (port_info.hwid or "").lower()
+    loc = (getattr(port_info, "location", None) or "").lower()
+    if "slcan" in desc or "mi_02" in hwid:
+        return True
+    if re.search(r":x\.2\b", hwid) or re.search(r":x\.2\b", loc):
+        return True
+    return False
+
+
+def is_known_fc_vid(port_info) -> bool:
+    hwid = (port_info.hwid or "").lower()
+    return any(
+        tok in hwid
+        for tok in (
+            "1209:5740",
+            "1209:5741",
+            "2dae:",
+            "3162:",
+            "vid_1209&pid_5740",
+            "vid_1209&pid_5741",
+            "vid_2dae",
+            "vid_3162",
+        )
+    )
+
+
 def rank_port(port_info) -> int:
-    desc = f"{port_info.description} {port_info.manufacturer or ''} {port_info.hwid}".lower()
-    if "slcan" in desc:
+    desc = f"{port_info.description or ''} {port_info.manufacturer or ''} {port_info.hwid or ''}".lower()
+    hwid = (port_info.hwid or "").lower()
+    if is_secondary_iface(port_info):
         return 3
-    if any(k in desc for k in ("mavlink", "pixhawk", "ardupilot", "holybro", "chibios")):
+    if is_known_fc_vid(port_info) or any(
+        k in desc for k in ("mavlink", "pixhawk", "ardupilot", "holybro", "matek", "chibios", "cube")
+    ):
         return 0
-    if "usb" in desc or "stm" in desc:
+    if "0483:" in hwid or "vid_0483" in hwid or "usb" in desc or "stm" in desc:
         return 1
     return 2
+
+
+def format_port_label(port_info) -> str:
+    tag = ""
+    if is_secondary_iface(port_info):
+        tag = " [SLCAN / вторинний]"
+    elif is_known_fc_vid(port_info):
+        tag = " [ArduPilot / Matek / Pixhawk]"
+    return f"{port_info.device} — {port_info.description}{tag}"
+
+
+def convert_intel_hex_to_bin(hex_path: Path, out_bin_path: Path) -> tuple[int, int]:
+    upper_addr = 0
+    chunks: list[tuple[int, bytes]] = []
+
+    with hex_path.open("r", encoding="ascii", errors="ignore") as f:
+        for line_no, raw in enumerate(f, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            if not line.startswith(":"):
+                raise ValueError(f"Некоректний рядок {line_no} у HEX-файлі (не починається з ':').")
+            try:
+                raw_bytes = bytes.fromhex(line[1:])
+            except ValueError as e:
+                raise ValueError(f"Помилка розбору HEX у рядку {line_no}: {e}") from e
+            if len(raw_bytes) < 5 or (sum(raw_bytes) & 0xFF) != 0:
+                raise ValueError(f"Помилка контрольної суми HEX у рядку {line_no}.")
+
+            length = raw_bytes[0]
+            addr16 = (raw_bytes[1] << 8) | raw_bytes[2]
+            rtype = raw_bytes[3]
+            data = raw_bytes[4 : 4 + length]
+            if len(data) != length:
+                raise ValueError(f"Неповні дані у рядку {line_no} HEX-файлу.")
+
+            if rtype == 0x00:
+                chunks.append((upper_addr + addr16, data))
+            elif rtype == 0x01:
+                break
+            elif rtype == 0x02:
+                upper_addr = int.from_bytes(data, "big") << 4
+            elif rtype == 0x04:
+                upper_addr = int.from_bytes(data, "big") << 16
+            elif rtype in (0x03, 0x05):
+                continue
+
+    if not chunks:
+        raise ValueError("HEX-файл не містить блоків прошивки.")
+
+    min_addr = min(a for a, _ in chunks)
+    max_addr = max(a + len(d) for a, d in chunks)
+    span = max_addr - min_addr
+
+    if span <= 0 or span > 8 * 1024 * 1024:
+        raise ValueError(f"Підозрілий розмір образу ({span} байт, старт 0x{min_addr:08X}). Перевірте HEX-файл.")
+
+    buf = bytearray(b"\xff") * span
+    for a, d in chunks:
+        off = a - min_addr
+        buf[off : off + len(d)] = d
+
+    out_bin_path.write_bytes(buf)
+    return min_addr, span
 
 
 def prepare_param_file(src_path: Path, strip_calib: bool) -> tuple[Path, dict[str, float], dict]:
@@ -201,25 +313,29 @@ def prepare_param_file(src_path: Path, strip_calib: bool) -> tuple[Path, dict[st
 class BittecFlasherGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"{APP_NAME} v{APP_VERSION} — Прошивка та параметри MAVLink")
-        self.root.geometry("790x620")
-        self.root.minsize(710, 520)
+        self.root.title(f"{APP_NAME} v{APP_VERSION} — Прошивка (.apj / DFU) та параметри MAVLink")
+        self.root.geometry("820x650")
+        self.root.minsize(730, 540)
 
         self.log_queue: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.active_proc: subprocess.Popen | None = None
 
-        self.fw_var = tk.StringVar(value=find_default_file(BASE_DIR, ("*.apj",)))
+        self.fw_var = tk.StringVar(value=find_default_file(BASE_DIR, ("*.apj", "*_with_bl.hex", "*.hex")))
         self.param_var = tk.StringVar(
             value=find_default_file(BASE_DIR, ("*.param", "*.parm"), skip_suffix="_clean")
         )
         self.port_var = tk.StringVar(value="Авто")
         self.strip_calib_var = tk.BooleanVar(value=False)
         self.skip_flash_var = tk.BooleanVar(value=False)
+        self.skip_params_var = tk.BooleanVar(value=False)
+        self.fw_mode_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готовий до роботи")
 
         self._build_ui()
+        self.fw_var.trace_add("write", lambda *_: self._update_fw_mode_label())
+        self._update_fw_mode_label()
         self.refresh_ports()
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -231,22 +347,31 @@ class BittecFlasherGUI:
         frame_files.pack(fill="x", **pad)
         frame_files.columnconfigure(1, weight=1)
 
-        ttk.Label(frame_files, text="Прошивка (.apj):").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(frame_files, text="Прошивка (.apj / .hex / .bin):").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(frame_files, textvariable=self.fw_var).grid(row=0, column=1, sticky="ew", padx=6, pady=4)
         ttk.Button(frame_files, text="Обрати...", command=self._browse_fw).grid(row=0, column=2, pady=4)
 
-        ttk.Label(frame_files, text="Параметри (.param/.parm):").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(frame_files, textvariable=self.param_var).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frame_files, text="Обрати...", command=self._browse_param).grid(row=1, column=2, pady=4)
+        ttk.Label(frame_files, textvariable=self.fw_mode_var, foreground="#1f5aa6").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(0, 4)
+        )
 
-        frame_opts = ttk.LabelFrame(self.root, text="Параметри заливки", padding=10)
+        ttk.Label(frame_files, text="Параметри (.param/.parm, опційно):").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(frame_files, textvariable=self.param_var).grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Button(frame_files, text="Обрати...", command=self._browse_param).grid(row=2, column=2, pady=4)
+
+        frame_opts = ttk.LabelFrame(self.root, text="Підключення та параметри заливки", padding=10)
         frame_opts.pack(fill="x", **pad)
         frame_opts.columnconfigure(1, weight=1)
 
         ttk.Label(frame_opts, text="COM-порт:").grid(row=0, column=0, sticky="w", pady=4)
         self.port_combo = ttk.Combobox(frame_opts, textvariable=self.port_var, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frame_opts, text="Оновити порти", command=self.refresh_ports).grid(row=0, column=2, pady=4)
+
+        port_btn_box = ttk.Frame(frame_opts)
+        port_btn_box.grid(row=0, column=2, pady=4)
+        ttk.Button(port_btn_box, text="Оновити порти", command=self.refresh_ports).pack(side="left", padx=(0, 6))
+        ttk.Button(port_btn_box, text="Перевірити DFU", command=self.check_dfu_clicked).pack(side="left", padx=(0, 6))
+        ttk.Button(port_btn_box, text="Зняти захист", command=self.unprotect_dfu_clicked).pack(side="left")
 
         ttk.Checkbutton(
             frame_opts,
@@ -256,9 +381,17 @@ class BittecFlasherGUI:
 
         ttk.Checkbutton(
             frame_opts,
-            text="Тільки підготувати й залити параметри (пропустити прошивку .apj)",
+            text="Тільки підготувати й залити параметри (пропустити прошивку .apj / .hex)",
             variable=self.skip_flash_var,
+            command=self._on_skip_flash_toggle,
         ).grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
+
+        ttk.Checkbutton(
+            frame_opts,
+            text="Тільки прошити контролер (пропустити підготовку й заливку параметрів)",
+            variable=self.skip_params_var,
+            command=self._on_skip_params_toggle,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
 
         frame_btns = ttk.Frame(self.root)
         frame_btns.pack(fill="x", padx=10, pady=6)
@@ -286,18 +419,34 @@ class BittecFlasherGUI:
         self.log_box = scrolledtext.ScrolledText(frame_log, state="disabled", font=("Consolas", 9), wrap="word")
         self.log_box.pack(fill="both", expand=True)
 
+    def _update_fw_mode_label(self):
+        fw_str = self.fw_var.get().strip()
+        if not fw_str:
+            self.fw_mode_var.set("Режим прошивки: оберіть .apj (оновлення ArduPilot) або *_with_bl.hex (первинна прошивка DFU)")
+            return
+        ext = Path(fw_str).suffix.lower()
+        if ext == ".apj":
+            self.fw_mode_var.set("Режим прошивки: ArduPilot Bootloader (.apj) — для Pixhawk 6C, Matek H743 та інших плат з ArduPilot")
+        elif ext in (".hex", ".bin"):
+            self.fw_mode_var.set("Режим прошивки: STM32 DFU (.hex / .bin) — первинна прошивка через кнопку BOOT (Matek H743 тощо)")
+        else:
+            self.fw_mode_var.set(f"Непідтримуваний формат файлу ({ext}). Оберіть .apj, .hex або .bin.")
+
     def _show_about(self):
+        dfu_path = find_dfu_util()
+        dfu_state = "вшито" if dfu_path else "не знайдено"
         info = (
             f"{APP_NAME} v{APP_VERSION}\n"
             f"{APP_COPYRIGHT}\n"
             f"GitHub: {APP_REPO}\n"
             "Ліцензія: GNU GPLv3\n\n"
             "Незалежна утиліта для автоматичного очищення параметрів,\n"
-            "прошивки (.apj) та двопрохідної заливки параметрів MAVLink\n"
-            "для польотних контролерів, сумісних з ArduPilot / Pixhawk.\n\n"
+            "прошивки (.apj та STM32 DFU .hex/.bin) і двопрохідної заливки\n"
+            "параметрів MAVLink для контролерів ArduPilot (Pixhawk 6C, Matek H743 тощо).\n\n"
             "Використані відкриті компоненти:\n"
             "• pymavlink (LGPLv3)\n"
             "• uploader.py — PX4 / ArduPilot (BSD-3-Clause / GPLv3)\n"
+            f"• dfu-util ({dfu_state}, GPLv2+) та libusb (LGPLv2.1+)\n"
             "• pyserial, lxml (BSD-3-Clause), fastcrc (MIT)\n\n"
             "УВАГА: ПЗ надається «як є» (AS IS) без жодних гарантій.\n"
             "Перед прошивкою обов'язково знімайте пропелери та від'єднуйте\n"
@@ -307,9 +456,14 @@ class BittecFlasherGUI:
 
     def _browse_fw(self):
         p = filedialog.askopenfilename(
-            title="Оберіть файл прошивки (.apj)",
+            title="Оберіть файл прошивки (.apj або *_with_bl.hex)",
             initialdir=str(BASE_DIR),
-            filetypes=[("Firmware files", "*.apj"), ("Усі файли", "*.*")],
+            filetypes=[
+                ("Прошивки ArduPilot / DFU", "*.apj *.hex *.bin"),
+                ("ArduPilot Bootloader (.apj)", "*.apj"),
+                ("STM32 DFU (.hex / .bin)", "*.hex *.bin"),
+                ("Усі файли", "*.*"),
+            ],
         )
         if p:
             self.fw_var.set(p)
@@ -325,10 +479,106 @@ class BittecFlasherGUI:
 
     def refresh_ports(self):
         ports = sorted(serial.tools.list_ports.comports(), key=rank_port)
-        items = ["Авто"] + [f"{p.device} — {p.description}" for p in ports]
+        items = ["Авто"] + [format_port_label(p) for p in ports]
         self.port_combo["values"] = items
         if self.port_var.get() not in items:
             self.port_var.set("Авто")
+
+    def check_dfu_clicked(self):
+        dfu_exe = find_dfu_util()
+        if not dfu_exe:
+            messagebox.showerror("DFU недоступний", "Не знайдено dfu-util.exe поруч із програмою або всередині збірки.")
+            return
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(
+                [str(dfu_exe), "-l"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                creationflags=creationflags,
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        except Exception as e:
+            messagebox.showerror("Помилка DFU", f"Не вдалося запустити dfu-util: {e}")
+            return
+
+        self.log("=== Перевірка STM32 DFU ===")
+        for line in out.splitlines():
+            if line.strip():
+                self.log(f"  {line.strip()}")
+
+        low = out.lower()
+        if "0483:df11" in low and ("@internal flash" in low or "alt=0" in low):
+            messagebox.showinfo(
+                "DFU готовий",
+                "Знайдено контролер STM32 у режимі DFU (0483:df11) з доступом до Internal Flash.\n\n"
+                "Можна запускати прошивку файлу *_with_bl.hex.",
+            )
+        elif "cannot open dfu device" in low or "libusb_error_not_supported" in low or "libusb_error_access" in low:
+            messagebox.showwarning(
+                "Потрібен драйвер WinUSB",
+                "Контролер у режимі DFU (0483:df11) знайдено, але Windows використовує несумісний драйвер (STTub30).\n\n"
+                "Встановіть драйвер WinUSB через ImpulseRC Driver Fixer або Zadig (оберіть 'STM32 BOOTLOADER' → WinUSB) "
+                "і повторіть перевірку.",
+            )
+        else:
+            messagebox.showinfo(
+                "DFU не знайдено",
+                "Пристрій STM32 DFU (0483:df11) не виявлено.\n\n"
+                "Щоб перевести Matek H743 у режим DFU:\n"
+                "1. Від'єднайте USB та акумулятор.\n"
+                "2. Затисніть кнопку BOOT на платі.\n"
+                "3. Утримуючи BOOT, підключіть USB до ПК і відпустіть кнопку.",
+            )
+
+    def unprotect_dfu_clicked(self):
+        dfu_exe = find_dfu_util()
+        if not dfu_exe:
+            messagebox.showerror("DFU недоступний", "Не знайдено dfu-util.exe поруч із програмою або всередині збірки.")
+            return
+        ok = messagebox.askyesno(
+            "Підтвердження зняття захисту",
+            "Зняття захисту (unprotect) повністю зітре внутрішню пам'ять контролера STM32 та перезавантажить його.\n\n"
+            "Переконайтеся, що плата підключена в режимі BOOT (DFU) без пропелерів і силового акумулятора.\n\n"
+            "Продовжити?",
+        )
+        if not ok:
+            return
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        with tempfile.TemporaryDirectory(prefix="bittec_unprot_") as tmpdir:
+            dummy_bin = Path(tmpdir) / "dummy.bin"
+            dummy_bin.write_bytes(b"\x00\x00\x00\x00")
+            try:
+                proc = subprocess.run(
+                    [str(dfu_exe), "-d", "0483:df11", "-a", "0", "-s", "0x08000000:unprotect:force", "-D", str(dummy_bin)],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    creationflags=creationflags,
+                )
+                out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            except Exception as e:
+                messagebox.showerror("Помилка unprotect", f"Не вдалося виконати зняття захисту: {e}")
+                return
+
+        self.log("=== Зняття захисту STM32 DFU (unprotect) ===")
+        for line in out.splitlines():
+            if line.strip():
+                self.log(f"  {line.strip()}")
+
+        low = out.lower()
+        if "erases flash" in low or "disconnects" in low or proc.returncode == 0:
+            messagebox.showinfo(
+                "Захист знято",
+                "Команду зняття захисту виконано — контролер очищено та перезавантажено.\n\n"
+                "Щоб прошити контролер, від'єднайте USB, затисніть BOOT, підключіть USB і натисніть «Перевірити DFU».",
+            )
+        else:
+            messagebox.showwarning(
+                "Перевірте стан DFU",
+                "dfu-util повернув повідомлення про помилку. Перевірте журнал виконання та перепідключіть плату у режим BOOT.",
+            )
 
     def _get_selected_port(self) -> str | None:
         val = self.port_var.get().strip()
@@ -343,6 +593,11 @@ class BittecFlasherGUI:
 
     def log(self, msg: str):
         self.log_queue.put(("log", msg))
+        try:
+            with (BASE_DIR / "bittec_flasher.log").open("a", encoding="utf-8") as lf:
+                lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
 
     def set_progress(self, value: float, status: str):
         self.log_queue.put(("prog", (value, status)))
@@ -366,6 +621,25 @@ class BittecFlasherGUI:
                     val, st = payload
                     self.progress["value"] = val
                     self.status_var.set(st)
+                elif kind == "prompt_unprotect":
+                    ev, res_box = payload
+                    res_box["unprotect"] = messagebox.askyesno(
+                        "Пам'ять контролера заблоковано",
+                        "Під час DFU-прошивки виявлено блокування пам'яті або стирання секторів (RDP / WRP).\n\n"
+                        "Зняти захист (unprotect) зараз? УВАГА: це повністю зітре пам'ять контролера та перезавантажить його.\n"
+                        "Перед продовженням зніміть пропелери та від'єднайте силовий акумулятор.",
+                    )
+                    ev.set()
+                elif kind == "prompt_reconnect":
+                    ev, res_box = payload
+                    res_box["retry"] = messagebox.askretrycancel(
+                        "Перепідключіть USB після DFU",
+                        "DFU-прошивку завершено, але Windows не визначила COM-порт контролера автоматично.\n\n"
+                        "1. Від'єднайте USB-кабель від ПК на 3–5 секунд.\n"
+                        "2. Підключіть USB знову (БЕЗ натискання кнопки BOOT).\n"
+                        "3. Дочекайтеся звуку підключення Windows і натисніть «Повторити».",
+                    )
+                    ev.set()
                 elif kind == "done":
                     self._set_running(False)
                     ok, summary = payload
@@ -378,28 +652,43 @@ class BittecFlasherGUI:
             pass
         self.root.after(100, self._poll_queue)
 
-    def _validate_inputs(self, need_fw: bool) -> tuple[Path | None, Path] | None:
+    def _validate_inputs(self, need_fw: bool, need_param: bool) -> tuple[Path | None, Path | None] | None:
         param_str = self.param_var.get().strip()
-        if not param_str or not Path(param_str).is_file():
+        param_path: Path | None = None
+        if param_str:
+            if not Path(param_str).is_file():
+                messagebox.showerror("Помилка", "Вказаний файл параметрів не існує.")
+                return None
+            param_path = Path(param_str)
+        elif need_param:
             messagebox.showerror("Помилка", "Оберіть існуючий файл параметрів (.param / .parm).")
             return None
 
-        fw_path = None
+        fw_path: Path | None = None
         if need_fw:
             fw_str = self.fw_var.get().strip()
             if not fw_str or not Path(fw_str).is_file():
-                messagebox.showerror("Помилка", "Оберіть існуючий файл прошивки (.apj).")
+                messagebox.showerror("Помилка", "Оберіть існуючий файл прошивки (.apj, .hex або .bin).")
                 return None
             fw_path = Path(fw_str)
-            if not (RESOURCE_DIR / "uploader.py").is_file():
-                messagebox.showerror("Помилка", f"Не знайдено uploader.py у {RESOURCE_DIR}.")
+            ext = fw_path.suffix.lower()
+            if ext == ".apj":
+                if not (RESOURCE_DIR / "uploader.py").is_file():
+                    messagebox.showerror("Помилка", f"Не знайдено uploader.py у {RESOURCE_DIR}.")
+                    return None
+            elif ext in (".hex", ".bin"):
+                if not find_dfu_util():
+                    messagebox.showerror("Помилка", "Не знайдено dfu-util.exe для прошивки через STM32 DFU.")
+                    return None
+            else:
+                messagebox.showerror("Помилка", f"Непідтримуваний формат прошивки: {ext}. Оберіть .apj, .hex або .bin.")
                 return None
 
-        return fw_path, Path(param_str)
+        return fw_path, param_path
 
     def start_prepare_only(self):
-        res = self._validate_inputs(need_fw=False)
-        if not res:
+        res = self._validate_inputs(need_fw=False, need_param=True)
+        if not res or res[1] is None:
             return
         _, param_path = res
         self.stop_event.clear()
@@ -411,12 +700,67 @@ class BittecFlasherGUI:
         )
         self.worker.start()
 
+    def _on_skip_flash_toggle(self):
+        if self.skip_flash_var.get():
+            self.skip_params_var.set(False)
+
+    def _on_skip_params_toggle(self):
+        if self.skip_params_var.get():
+            self.skip_flash_var.set(False)
+
+    def _ask_unprotect_on_lock(self) -> bool:
+        ev = threading.Event()
+        res_box = {"unprotect": False}
+        self.log_queue.put(("prompt_unprotect", (ev, res_box)))
+        while not ev.is_set():
+            if self.stop_event.is_set():
+                return False
+            ev.wait(0.2)
+        return bool(res_box["unprotect"])
+
+    def _run_unprotect_cmd(self, dfu_exe: Path) -> tuple[bool, str]:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        with tempfile.TemporaryDirectory(prefix="bittec_unprot_") as tmpdir:
+            dummy_bin = Path(tmpdir) / "dummy.bin"
+            dummy_bin.write_bytes(b"\x00\x00\x00\x00")
+            proc = subprocess.run(
+                [str(dfu_exe), "-d", "0483:df11", "-a", "0", "-s", "0x08000000:unprotect:force", "-D", str(dummy_bin)],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                creationflags=creationflags,
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        self.log("=== Зняття захисту STM32 DFU (unprotect) ===")
+        for line in out.splitlines():
+            if line.strip():
+                self.log(f"  {line.strip()}")
+        low = out.lower()
+        ok = ("erases flash" in low) or ("disconnects" in low) or (proc.returncode == 0)
+        return ok, out
+
+    def _ask_manual_usb_reconnect(self) -> bool:
+        ev = threading.Event()
+        res_box = {"retry": False}
+        self.log_queue.put(("prompt_reconnect", (ev, res_box)))
+        while not ev.is_set():
+            if self.stop_event.is_set():
+                return False
+            ev.wait(0.2)
+        return bool(res_box["retry"])
+
     def start_full_process(self):
         skip_flash = self.skip_flash_var.get()
-        res = self._validate_inputs(need_fw=not skip_flash)
+        skip_params = self.skip_params_var.get()
+        if skip_flash and skip_params:
+            messagebox.showerror("Помилка", "Не можна одночасно пропустити і прошивку, і параметри.")
+            return
+        res = self._validate_inputs(need_fw=not skip_flash, need_param=skip_flash)
         if not res:
             return
         fw_path, param_path = res
+        if skip_params:
+            param_path = None
         self.stop_event.clear()
         self._set_running(True)
         self.worker = threading.Thread(
@@ -469,7 +813,7 @@ class BittecFlasherGUI:
             self.set_progress(0, "Помилка підготовки")
             self.log_queue.put(("done", (False, f"Помилка: {e}")))
 
-    def _connect_mavlink(self, explicit_port: str | None, timeout_total: int = 60):
+    def _connect_mavlink(self, explicit_port: str | None, timeout_total: int = 75):
         deadline = time.time() + timeout_total
         while time.time() < deadline:
             if self.stop_event.is_set():
@@ -499,7 +843,9 @@ class BittecFlasherGUI:
                     except Exception:
                         pass
             time.sleep(1.5)
-        raise RuntimeError("Не вдалося підключитись до контролера по MAVLink. Закрийте GCS (Mission Planner / QGC) і перевірте USB.")
+        raise RuntimeError(
+            "Не вдалося підключитись до контролера по MAVLink. Закрийте Mission Planner / QGC і перевірте USB."
+        )
 
     def _download_params(self, conn) -> dict[str, tuple[float, int]]:
         while conn.recv_match(blocking=False) is not None:
@@ -571,7 +917,7 @@ class BittecFlasherGUI:
 
         return written, skipped, missing, failed
 
-    def _reboot_fc(self, conn, wait_sec: int = 8):
+    def _reboot_fc(self, conn, wait_sec: int = 9):
         self.log("[REBOOT] Перезавантаження контролера...")
         conn.mav.command_long_send(
             conn.target_system,
@@ -590,28 +936,18 @@ class BittecFlasherGUI:
                 raise InterruptedError("Зупинено користувачем")
             time.sleep(1)
 
-    def _run_uploader(self, fw_path: Path, explicit_port: str | None):
-        if getattr(sys, "frozen", False):
-            cmd = [sys.executable, "--run-uploader"]
-        else:
-            cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--run-uploader"]
-        if explicit_port:
-            cmd += ["--port", explicit_port]
-        cmd.append(str(fw_path))
-
-        self.log(f"[FLASH] Запуск вбудованого завантажувача для {fw_path.name}...")
-        self.log("[FLASH] Підключіть польотний контролер до USB (або перепідключіть, якщо він уже вставлений).")
-
+    def _stream_process(self, cmd: list[str], cwd: Path) -> tuple[int, list[str]]:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.active_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            cwd=str(BASE_DIR),
+            cwd=str(cwd),
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
             creationflags=creationflags,
         )
 
+        lines: list[str] = []
         buf = ""
         last_cr_log = 0.0
         assert self.active_proc.stdout is not None
@@ -623,65 +959,202 @@ class BittecFlasherGUI:
             if c == "\n":
                 line = buf.strip()
                 if line:
+                    lines.append(line)
                     self.log(f"  {line}")
                 buf = ""
             elif c == "\r":
                 line = buf.strip()
                 now = time.time()
-                if line and (now - last_cr_log > 0.6 or "100%" in line):
+                is_prog = bool(re.match(r"^(Erase|Download|Upload)\s+\[[^\]]*\]\s+\d+%\s+\d+\s+bytes$", line))
+                if line and ((not is_prog) or (now - last_cr_log > 0.6) or ("100%" in line)):
+                    lines.append(line)
                     self.log(f"  {line}")
-                    last_cr_log = now
+                    if is_prog:
+                        last_cr_log = now
                 buf = ""
             else:
                 buf += c
 
         if buf.strip():
+            lines.append(buf.strip())
             self.log(f"  {buf.strip()}")
 
         rc = self.active_proc.wait()
         self.active_proc = None
+        return rc, lines
+
+    def _run_uploader(self, fw_path: Path, explicit_port: str | None):
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--run-uploader"]
+        else:
+            cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--run-uploader"]
+        if explicit_port:
+            cmd += ["--port", explicit_port]
+        cmd.append(str(fw_path))
+
+        self.log(f"[FLASH .apj] Запуск вбудованого завантажувача для {fw_path.name}...")
+        self.log("[FLASH .apj] Підключіть контролер (Pixhawk 6C / Matek H743) до USB або перепідключіть кабель.")
+
+        rc, _ = self._stream_process(cmd, BASE_DIR)
         if self.stop_event.is_set():
             raise InterruptedError("Прошивку зупинено користувачем")
         if rc != 0:
             raise RuntimeError(f"Завантажувач завершився з кодом {rc}")
 
+    def _run_dfu_flash(self, fw_path: Path):
+        dfu_exe = find_dfu_util()
+        if not dfu_exe:
+            raise RuntimeError("Не знайдено dfu-util.exe для прошивки STM32 DFU.")
+
+        self.log(f"[DFU] Підготовка прошивки {fw_path.name} для STM32 DFU (0483:df11)...")
+        with tempfile.TemporaryDirectory(prefix="bittec_dfu_") as tmpdir:
+            if fw_path.suffix.lower() == ".hex":
+                bin_path = Path(tmpdir) / f"{fw_path.stem}.bin"
+                base_addr, span = convert_intel_hex_to_bin(fw_path, bin_path)
+                self.log(f"[DFU] Конвертовано HEX → BIN: старт 0x{base_addr:08X}, розмір {span / 1024:.1f} КБ.")
+            else:
+                bin_path = fw_path
+                base_addr = 0x08000000
+                self.log(f"[DFU] Використано BIN: старт 0x{base_addr:08X}, розмір {fw_path.stat().st_size / 1024:.1f} КБ.")
+
+            if base_addr != 0x08000000:
+                self.log(f"[DFU] Увага: базова адреса образу 0x{base_addr:08X} (нестандартна для повного *_with_bl.hex).")
+
+            cmd = [
+                str(dfu_exe),
+                "-d", "0483:df11",
+                "-a", "0",
+                "-s", f"0x{base_addr:08x}:leave",
+                "-D", str(bin_path),
+            ]
+            self.log("[DFU] Переконайтеся, що Matek H743 підключено в режимі BOOT (DFU). Запуск запису...")
+            rc, lines = self._stream_process(cmd, dfu_exe.parent)
+
+        if self.stop_event.is_set():
+            raise InterruptedError("DFU-прошивку зупинено користувачем")
+
+        joined = "\n".join(lines).lower()
+        downloaded_ok = ("file downloaded successfully" in joined) or ("transitioning to dfumanifest" in joined) or (rc == 74 and bool(re.search(r"download\s*\[[^\]]*\]\s*100%", joined))) or (rc == 74 and bool(re.search(r"download\s*\[[^\]]*\]\s*100%", joined)))
+        if rc != 0 and downloaded_ok:
+            self.log("[DFU] Прошивку записано успішно (контролер вийшов із режиму DFU та перезавантажується).")
+            return
+        if rc != 0:
+            if "cannot open dfu device" in joined or "libusb_error_not_supported" in joined or "libusb_error_access" in joined:
+                raise RuntimeError(
+                    "Немає доступу до STM32 DFU (помилка драйвера Windows). Встановіть драйвер WinUSB через "
+                    "ImpulseRC Driver Fixer або Zadig (STM32 BOOTLOADER → WinUSB) і повторіть спробу."
+                )
+            if "no dfu capable usb device" in joined:
+                raise RuntimeError(
+                    "Контролер у режимі DFU не знайдено. Від'єднайте USB, затисніть кнопку BOOT на Matek H743, "
+                    "підключіть USB і натисніть «Перевірити DFU»."
+                )
+        is_locked = (
+            ("erase_page not correctly executed" in joined)
+            or ("set_address not correctly executed" in joined)
+            or ("mass_erase not correctly executed" in joined)
+            or ("read protection" in joined)
+            or ("write protect" in joined)
+        )
+        if is_locked:
+            self.log("[DFU] Виявлено блокування пам'яті контролера (RDP/WRP).")
+            if self._ask_unprotect_on_lock():
+                ok_unprot, _ = self._run_unprotect_cmd(dfu_exe)
+                if ok_unprot:
+                    raise RuntimeError(
+                        "Захист пам'яті знято, контролер очищено та перезавантажено. "
+                        "Від'єднайте USB, затисніть BOOT, підключіть USB і запустіть прошивку повторно."
+                    )
+                raise RuntimeError("Не вдалося виконати зняття захисту. Перевірте журнал виконання та режим BOOT.")
+            raise RuntimeError("Прошивку скасовано: пам'ять контролера заблоковано, зняття захисту відхилено.")
+        raise RuntimeError(f"dfu-util завершився з кодом {rc}. Перевірте журнал виконання.")
+
     def _run_full_pipeline(
         self,
         fw_path: Path | None,
-        param_path: Path,
+        param_path: Path | None,
         explicit_port: str | None,
         strip_calib: bool,
         skip_flash: bool,
     ):
         try:
-            self.set_progress(10, "Етап 1/5: Підготовка параметрів...")
-            _, target_params, stats = prepare_param_file(param_path, strip_calib)
-            self._log_prep_stats(target_params, stats)
+            target_params: dict[str, float] | None = None
+            if param_path is not None:
+                self.set_progress(10, "Етап 1/5: Підготовка параметрів...")
+                _, target_params, stats = prepare_param_file(param_path, strip_calib)
+                self._log_prep_stats(target_params, stats)
+            else:
+                self.log("[PARAMS] Файл параметрів не вказано — буде виконано лише прошивку.")
 
             if not skip_flash and fw_path is not None:
-                self.set_progress(25, "Етап 2/5: Прошивка .apj (підключіть USB)...")
-                self._run_uploader(fw_path, explicit_port)
-                self.log("[FLASH] Прошивка завершена. Очікування запуску контролера (8 сек)...")
-                for _ in range(8):
-                    if self.stop_event.is_set():
-                        raise InterruptedError("Зупинено користувачем")
-                    time.sleep(1)
+                is_dfu = fw_path.suffix.lower() in (".hex", ".bin")
+                if is_dfu:
+                    self.set_progress(25, "Етап 2/5: Первинна прошивка STM32 DFU...")
+                    self._run_dfu_flash(fw_path)
+                    wait_boot = 12
+                    self.log(f"[DFU] Прошивка завершена. Очікування першого запуску ArduPilot ({wait_boot} сек)...")
+                else:
+                    self.set_progress(25, "Етап 2/5: Прошивка .apj (підключіть USB)...")
+                    self._run_uploader(fw_path, explicit_port)
+                    wait_boot = 9
+                    self.log(f"[FLASH] Прошивка завершена. Очікування запуску контролера ({wait_boot} сек)...")
+
+                if target_params is not None:
+                    for _ in range(wait_boot):
+                        if self.stop_event.is_set():
+                            raise InterruptedError("Зупинено користувачем")
+                        time.sleep(1)
             else:
-                self.log("[FLASH] Прошивка .apj пропущена за налаштуванням.")
+                self.log("[FLASH] Прошивку пропущено за налаштуванням.")
+
+            if target_params is None or param_path is None:
+                self.set_progress(100, "Готово! Прошивку завершено.")
+                self.log_queue.put(("done", (True, "Прошивку контролера успішно завершено!")))
+                return
 
             self.set_progress(50, "Етап 3/5: Заливка параметрів (Прохід 1)...")
-            conn = self._connect_mavlink(explicit_port)
+            used_dfu = (not skip_flash) and (fw_path is not None) and (fw_path.suffix.lower() in (".hex", ".bin"))
+            if used_dfu:
+                conn = None
+                try:
+                    conn = self._connect_mavlink(explicit_port, timeout_total=18)
+                except RuntimeError:
+                    self.log("[MAVLink] Автопідключення після DFU не вдалося — запит ручного перепідключення USB.")
+                while conn is None:
+                    self.set_progress(48, "Очікування перепідключення USB (без кнопки BOOT)...")
+                    if not self._ask_manual_usb_reconnect():
+                        raise InterruptedError("Зупинено користувачем під час очікування перепідключення USB")
+                    self.log("[MAVLink] Повторний пошук контролера після ручного перепідключення USB...")
+                    try:
+                        conn = self._connect_mavlink(explicit_port, timeout_total=45)
+                    except RuntimeError:
+                        self.log("[MAVLink] Порт досі не знайдено. Перевірте кабель і спробуйте ще раз.")
+            else:
+                conn = self._connect_mavlink(explicit_port)
             cur1 = self._download_params(conn)
             w1, s1, m1, f1 = self._write_pass(conn, target_params, cur1)
             self.log(f"[Прохід 1] Записано: {w1}, вже збігались: {s1}, ще відсутні: {len(m1)}, помилок: {len(f1)}")
-            self._reboot_fc(conn, wait_sec=8)
+            self._reboot_fc(conn, wait_sec=9)
 
-            self.set_progress(75, "Етап 4/5: Дозаписування залежних параметрів (Прохід 2)...")
+            self.set_progress(70, "Етап 4/5: Дозаписування залежних параметрів (Прохід 2)...")
             conn = self._connect_mavlink(explicit_port)
             cur2 = self._download_params(conn)
             w2, s2, m2, f2 = self._write_pass(conn, target_params, cur2)
             self.log(f"[Прохід 2] Записано: {w2}, вже збігались: {s2}, відсутні: {len(m2)}, помилок: {len(f2)}")
-            self._reboot_fc(conn, wait_sec=8)
+            self._reboot_fc(conn, wait_sec=9)
+
+            self.set_progress(82, "Етап 4б/5: Повторна фіксація параметрів (Прохід 3)...")
+            conn = self._connect_mavlink(explicit_port)
+            cur3 = self._download_params(conn)
+            w3, s3, m3, f3 = self._write_pass(conn, target_params, cur3)
+            self.log(f"[Прохід 3] Записано: {w3}, вже збігались: {s3}, відсутні: {len(m3)}, помилок: {len(f3)}")
+            if w3 > 0:
+                self._reboot_fc(conn, wait_sec=9)
+            else:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
             self.set_progress(90, "Етап 5/5: Фінальна звірка параметрів та GPS...")
             conn = self._connect_mavlink(explicit_port)
