@@ -40,7 +40,7 @@ from pymavlink.dialects.v20 import ardupilotmega as _mav20  # noqa: E402, F401
 from pymavlink.dialects.v20 import common as _mav20_common  # noqa: E402, F401
 
 APP_NAME = "Bittec Flasher"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_COPYRIGHT = "© 2026 Bittec (https://bittec.com.ua)"
 APP_REPO = "https://github.com/zloytarik/bittec-flasher"
 
