@@ -87,6 +87,7 @@ CALIB_PATTERNS = [
 
 RO_RE = [re.compile(p, re.IGNORECASE) for p in READONLY_PATTERNS]
 CAL_RE = [re.compile(p, re.IGNORECASE) for p in CALIB_PATTERNS]
+SERVO_RE = re.compile(r"^SERVO.*$", re.IGNORECASE)
 
 
 def _maybe_run_embedded_uploader():
@@ -239,7 +240,7 @@ def convert_intel_hex_to_bin(hex_path: Path, out_bin_path: Path) -> tuple[int, i
     return min_addr, span
 
 
-def prepare_param_file(src_path: Path, strip_calib: bool) -> tuple[Path, dict[str, float], dict]:
+def prepare_param_file(src_path: Path, strip_calib: bool, strip_servo: bool = False, removed_servo_out: list[str] | None = None) -> tuple[Path, dict[str, float], dict]:
     clean_dict: dict[str, float] = {}
     removed_ro: list[str] = []
     removed_cal: list[str] = []
@@ -271,6 +272,12 @@ def prepare_param_file(src_path: Path, strip_calib: bool) -> tuple[Path, dict[st
             continue
         if is_cal:
             kept_cal.append(name)
+
+        is_servo = bool(SERVO_RE.match(name))
+        if is_servo and strip_servo:
+            if removed_servo_out is not None:
+                removed_servo_out.append(name)
+            continue
 
         clean_dict[name] = val_float
 
@@ -328,6 +335,7 @@ class BittecFlasherGUI:
         )
         self.port_var = tk.StringVar(value="Авто")
         self.strip_calib_var = tk.BooleanVar(value=False)
+        self.strip_servo_var = tk.BooleanVar(value=False)
         self.skip_flash_var = tk.BooleanVar(value=False)
         self.skip_params_var = tk.BooleanVar(value=False)
         self.fw_mode_var = tk.StringVar(value="")
@@ -381,17 +389,23 @@ class BittecFlasherGUI:
 
         ttk.Checkbutton(
             frame_opts,
+            text="Не перезаписувати налаштування сервоприводів (ігнорувати всі SERVO*)",
+            variable=self.strip_servo_var,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
+
+        ttk.Checkbutton(
+            frame_opts,
             text="Тільки підготувати й залити параметри (пропустити прошивку .apj / .hex)",
             variable=self.skip_flash_var,
             command=self._on_skip_flash_toggle,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
 
         ttk.Checkbutton(
             frame_opts,
             text="Тільки прошити контролер (пропустити підготовку й заливку параметрів)",
             variable=self.skip_params_var,
             command=self._on_skip_params_toggle,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
 
         frame_btns = ttk.Frame(self.root)
         frame_btns.pack(fill="x", padx=10, pady=6)
@@ -695,7 +709,7 @@ class BittecFlasherGUI:
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._run_prepare_only,
-            args=(param_path, self.strip_calib_var.get()),
+            args=(param_path, self.strip_calib_var.get(), self.strip_servo_var.get()),
             daemon=True,
         )
         self.worker.start()
@@ -765,7 +779,7 @@ class BittecFlasherGUI:
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._run_full_pipeline,
-            args=(fw_path, param_path, self._get_selected_port(), self.strip_calib_var.get(), skip_flash),
+            args=(fw_path, param_path, self._get_selected_port(), self.strip_calib_var.get(), skip_flash, self.strip_servo_var.get()),
             daemon=True,
         )
         self.worker.start()
@@ -801,11 +815,14 @@ class BittecFlasherGUI:
         if stats["legacy_gps"]:
             self.log(f"[УВАГА] Знайдено старі імена GPS (до версії 4.6): {', '.join(stats['legacy_gps'])}")
 
-    def _run_prepare_only(self, param_path: Path, strip_calib: bool):
+    def _run_prepare_only(self, param_path: Path, strip_calib: bool, strip_servo: bool = False):
         try:
             self.set_progress(25, "Очищення файлу параметрів...")
-            _, target_params, stats = prepare_param_file(param_path, strip_calib)
+            removed_servo: list[str] = []
+            _, target_params, stats = prepare_param_file(param_path, strip_calib, strip_servo, removed_servo)
             self._log_prep_stats(target_params, stats)
+            if strip_servo:
+                self.log(f"Виключено налаштувань сервоприводів (SERVO*): {len(removed_servo)}")
             self.set_progress(100, "Підготовка параметрів завершена")
             self.log_queue.put(("done", (True, f"Файл підготовлено:\n{stats['clean_path']}")))
         except Exception as e:
@@ -1076,13 +1093,17 @@ class BittecFlasherGUI:
         explicit_port: str | None,
         strip_calib: bool,
         skip_flash: bool,
+        strip_servo: bool = False,
     ):
         try:
             target_params: dict[str, float] | None = None
             if param_path is not None:
                 self.set_progress(10, "Етап 1/5: Підготовка параметрів...")
-                _, target_params, stats = prepare_param_file(param_path, strip_calib)
+                removed_servo: list[str] = []
+                _, target_params, stats = prepare_param_file(param_path, strip_calib, strip_servo, removed_servo)
                 self._log_prep_stats(target_params, stats)
+                if strip_servo:
+                    self.log(f"Виключено налаштувань сервоприводів (SERVO*): {len(removed_servo)}")
             else:
                 self.log("[PARAMS] Файл параметрів не вказано — буде виконано лише прошивку.")
 
