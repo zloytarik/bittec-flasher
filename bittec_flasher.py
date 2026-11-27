@@ -40,7 +40,7 @@ from pymavlink.dialects.v20 import ardupilotmega as _mav20  # noqa: E402, F401
 from pymavlink.dialects.v20 import common as _mav20_common  # noqa: E402, F401
 
 APP_NAME = "Bittec Flasher"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
 APP_COPYRIGHT = "© 2026 Bittec (https://bittec.com.ua)"
 APP_REPO = "https://github.com/zloytarik/bittec-flasher"
 
@@ -87,6 +87,185 @@ CALIB_PATTERNS = [
 
 RO_RE = [re.compile(p, re.IGNORECASE) for p in READONLY_PATTERNS]
 CAL_RE = [re.compile(p, re.IGNORECASE) for p in CALIB_PATTERNS]
+import json
+
+CFG_PATH = (
+    (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
+    / "bittec_flasher_cfg.json"
+)
+
+UI_TEXT = {
+    "ua": {
+        "win_title": "{app} v{ver} — Прошивка (.apj / DFU) та параметри MAVLink",
+        "frame_files": "Файли прошивки та параметрів",
+        "lbl_fw": "Прошивка (.apj / .hex / .bin):",
+        "btn_browse": "Обрати...",
+        "lbl_param": "Параметри (.param/.parm, опційно):",
+        "frame_opts": "Підключення та параметри заливки",
+        "lbl_port": "COM-порт:",
+        "port_auto": "Авто",
+        "btn_refresh": "Оновити порти",
+        "btn_dfu": "Перевірити DFU",
+        "btn_unprotect": "Зняти захист",
+        "chk_calib": "Вичистити калібрування датчиків (акселерометр, гіроскоп, компас — для серії бортів)",
+        "chk_servo": "Не перезаписувати налаштування сервоприводів (ігнорувати всі SERVO*)",
+        "chk_backup": "Створити резервну копію параметрів перед перезаписом",
+        "lbl_backup_name": "Назва файлу резерву:",
+        "btn_folder": "Папка...",
+        "backup_preview": "Папка резерву (створиться автоматично): {path}",
+        "chk_skip_flash": "Тільки підготувати й залити параметри (пропустити прошивку .apj / .hex)",
+        "chk_skip_params": "Тільки прошити контролер (пропустити підготовку й заливку параметрів)",
+        "btn_prep": "Тільки підготувати параметри",
+        "btn_run": "Підготувати та прошити",
+        "btn_stop": "Зупинити",
+        "btn_clear": "Очистити лог",
+        "btn_about": "Про програму",
+        "frame_log": "Журнал виконання",
+        "status_ready": "Готовий до роботи",
+        "fw_empty": "Режим прошивки: оберіть .apj (оновлення ArduPilot) або *_with_bl.hex (первинна прошивка DFU)",
+        "fw_apj": "Режим прошивки: ArduPilot Bootloader (.apj) — для Pixhawk 6C, Matek H743 та інших плат з ArduPilot",
+        "fw_dfu": "Режим прошивки: STM32 DFU (.hex / .bin) — первинна прошивка через кнопку BOOT (Matek H743 тощо)",
+        "fw_bad": "Непідтримуваний формат файлу ({ext}). Оберіть .apj, .hex або .bin.",
+        "about_title": "Про {app}",
+        "about_body": (
+            "{app} v{ver}\n{copy}\nGitHub: {repo}\nЛіцензія: GNU GPLv3\n\n"
+            "Незалежна утиліта для автоматичного очищення параметрів,\n"
+            "прошивки (.apj та STM32 DFU .hex/.bin) і двопрохідної заливки\n"
+            "параметрів MAVLink для контролерів ArduPilot (Pixhawk 6C, Matek H743 тощо).\n\n"
+            "Використані відкриті компоненти:\n• pymavlink (LGPLv3)\n"
+            "• uploader.py — PX4 / ArduPilot (BSD-3-Clause / GPLv3)\n"
+            "• dfu-util ({dfu}, GPLv2+) та libusb (LGPLv2.1+)\n• pyserial, lxml (BSD-3-Clause), fastcrc (MIT)\n\n"
+            "УВАГА: ПЗ надається «як є» (AS IS) без жодних гарантій.\n"
+            "Перед прошивкою обов'язково знімайте пропелери та від'єднуйте силовий акумулятор."
+        ),
+        "dfu_embedded": "вшито",
+        "dfu_missing": "не знайдено",
+    },
+    "en": {
+        "win_title": "{app} v{ver} — Firmware (.apj / DFU) & MAVLink Parameters",
+        "frame_files": "Firmware and Parameter Files",
+        "lbl_fw": "Firmware (.apj / .hex / .bin):",
+        "btn_browse": "Browse...",
+        "lbl_param": "Parameters (.param/.parm, optional):",
+        "frame_opts": "Connection and Flashing Options",
+        "lbl_port": "COM Port:",
+        "port_auto": "Auto",
+        "btn_refresh": "Refresh Ports",
+        "btn_dfu": "Check DFU",
+        "btn_unprotect": "Unprotect",
+        "chk_calib": "Strip sensor calibrations (accelerometer, gyroscope, compass — for fleet flashing)",
+        "chk_servo": "Do not overwrite servo settings (ignore all SERVO*)",
+        "chk_backup": "Create parameter backup before overwriting",
+        "lbl_backup_name": "Backup file name:",
+        "btn_folder": "Folder...",
+        "backup_preview": "Backup folder (created automatically): {path}",
+        "chk_skip_flash": "Prepare and upload parameters only (skip .apj / .hex flashing)",
+        "chk_skip_params": "Flash controller only (skip parameter preparation and upload)",
+        "btn_prep": "Prepare Parameters Only",
+        "btn_run": "Prepare & Flash",
+        "btn_stop": "Stop",
+        "btn_clear": "Clear Log",
+        "btn_about": "About",
+        "frame_log": "Execution Log",
+        "status_ready": "Ready",
+        "fw_empty": "Flashing mode: select .apj (ArduPilot update) or *_with_bl.hex (initial DFU flash)",
+        "fw_apj": "Flashing mode: ArduPilot Bootloader (.apj) — for Pixhawk 6C, Matek H743 and other ArduPilot boards",
+        "fw_dfu": "Flashing mode: STM32 DFU (.hex / .bin) — initial flash via BOOT button (Matek H743, etc.)",
+        "fw_bad": "Unsupported file format ({ext}). Select .apj, .hex or .bin.",
+        "about_title": "About {app}",
+        "about_body": (
+            "{app} v{ver}\n{copy}\nGitHub: {repo}\nLicense: GNU GPLv3\n\n"
+            "Standalone utility for automatic parameter cleanup,\n"
+            "firmware flashing (.apj and STM32 DFU .hex/.bin) and multi-pass\n"
+            "MAVLink parameter upload for ArduPilot controllers (Pixhawk 6C, Matek H743, etc.).\n\n"
+            "Open-source components used:\n• pymavlink (LGPLv3)\n"
+            "• uploader.py — PX4 / ArduPilot (BSD-3-Clause / GPLv3)\n"
+            "• dfu-util ({dfu}, GPLv2+) and libusb (LGPLv2.1+)\n• pyserial, lxml (BSD-3-Clause), fastcrc (MIT)\n\n"
+            "DISCLAIMER: Software is provided AS IS without warranty of any kind.\n"
+            "Always remove propellers and disconnect the main battery before flashing."
+        ),
+        "dfu_embedded": "embedded",
+        "dfu_missing": "not found",
+    },
+}
+
+UA_TO_EN_EXACT = {
+    "Готовий до роботи": "Ready",
+    "Очищення файлу параметрів...": "Cleaning parameter file...",
+    "Підготовка параметрів завершена": "Parameter preparation completed",
+    "Помилка підготовки": "Preparation error",
+    "Етап 1/5: Підготовка параметрів...": "Step 1/5: Preparing parameters...",
+    "Створення резервної копії параметрів...": "Creating parameter backup...",
+    "Етап 2/5: Первинна прошивка STM32 DFU...": "Step 2/5: Initial STM32 DFU flashing...",
+    "Етап 2/5: Прошивка .apj (підключіть USB)...": "Step 2/5: Flashing .apj (connect USB)...",
+    "Готово! Прошивку завершено.": "Done! Flashing completed.",
+    "Прошивку контролера успішно завершено!": "Controller flashing completed successfully!",
+    "Етап 3/5: Заливка параметрів (Прохід 1)...": "Step 3/5: Uploading parameters (Pass 1)...",
+    "Очікування перепідключення USB (без кнопки BOOT)...": "Waiting for USB reconnect (without BOOT button)...",
+    "Етап 4/5: Дозаписування залежних параметрів (Прохід 2)...": "Step 4/5: Writing dependent parameters (Pass 2)...",
+    "Етап 5/5: Контрольна перевірка параметрів (Прохід 3)...": "Step 5/5: Verifying parameters (Pass 3)...",
+    "Помилка": "Error",
+    "Увага": "Warning",
+    "Готово": "Done",
+    "Підтвердження": "Confirmation",
+    "Зупинено": "Stopped",
+    "Не можна одночасно пропустити і прошивку, і параметри.": "Cannot skip both firmware flashing and parameter upload at the same time.",
+    "Оберіть файл прошивки (.apj, .hex або .bin).": "Please select a firmware file (.apj, .hex, or .bin).",
+    "Файл прошивки не знайдено.": "Firmware file not found.",
+    "Оберіть файл параметрів (.param або .parm).": "Please select a parameter file (.param or .parm).",
+    "Файл параметрів не знайдено.": "Parameter file not found.",
+    "Не знайдено dfu-util.exe для перевірки DFU.": "dfu-util.exe was not found for DFU check.",
+    "Захист пам'яті (RDP/WRP) успішно знято!\n\nВід'єднайте USB, затисніть BOOT, підключіть USB і запустіть прошивку.": "Memory protection (RDP/WRP) removed successfully!\n\nDisconnect USB, hold BOOT, reconnect USB, and start flashing.",
+    "Контролер заблоковано (RDP/WRP). Виконати повне стирання чипа і зняття захисту?": "Controller memory is locked (RDP/WRP). Perform full chip erase and unprotect?",
+    "Після DFU-прошивки від'єднайте кабель USB, відпустіть кнопку BOOT, підключіть USB знову та натисніть OK.": "After DFU flashing, disconnect the USB cable, release the BOOT button, reconnect USB, and click OK.",
+    "Виконується операція. Зупинити та закрити програму?": "An operation is currently running. Stop and close the application?",
+}
+
+def _load_lang_cfg() -> str:
+    try:
+        if CFG_PATH.is_file():
+            data = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            if data.get("lang") in ("ua", "en"):
+                return data["lang"]
+    except Exception:
+        pass
+    return "ua"
+
+def _save_lang_cfg(lang: str) -> None:
+    try:
+        CFG_PATH.write_text(json.dumps({"lang": lang}, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _translate_dynamic_text(text: str, lang: str) -> str:
+    if lang != "en" or not isinstance(text, str) or not text:
+        return text
+    if text in UA_TO_EN_EXACT:
+        return UA_TO_EN_EXACT[text]
+    out = text.replace(" [SLCAN / вторинний]", " [SLCAN / secondary]")
+    if out.startswith("Файл підготовлено:\n"):
+        out = "File prepared:\n" + out[len("Файл підготовлено:\n"):]
+    if out.startswith("Помилка: "):
+        out = "Error: " + out[len("Помилка: "):]
+    if out.startswith("Виявлено пристрій STM32 DFU"):
+        out = out.replace("Виявлено пристрій STM32 DFU", "STM32 DFU device detected")
+    if out.startswith("Пристрій STM32 DFU не знайдено"):
+        out = out.replace("Пристрій STM32 DFU не знайдено", "STM32 DFU device not found")
+    return out
+
+_ORIG_MB_INFO, _ORIG_MB_ERR, _ORIG_MB_WARN, _ORIG_MB_YESNO = (
+    messagebox.showinfo, messagebox.showerror, messagebox.showwarning, messagebox.askyesno
+)
+
+def _install_i18n_messagebox(lang_var: tk.StringVar) -> None:
+    def _wrap(fn):
+        def inner(title, message, *args, **kwargs):
+            lang = lang_var.get()
+            return fn(_translate_dynamic_text(title, lang), _translate_dynamic_text(message, lang), *args, **kwargs)
+        return inner
+    messagebox.showinfo, messagebox.showerror, messagebox.showwarning, messagebox.askyesno = (
+        _wrap(_ORIG_MB_INFO), _wrap(_ORIG_MB_ERR), _wrap(_ORIG_MB_WARN), _wrap(_ORIG_MB_YESNO)
+    )
 SERVO_RE = re.compile(r"^SERVO.*$", re.IGNORECASE)
 
 
@@ -334,93 +513,193 @@ class BittecFlasherGUI:
             value=find_default_file(BASE_DIR, ("*.param", "*.parm"), skip_suffix="_clean")
         )
         self.port_var = tk.StringVar(value="Авто")
+        self.lang_var = tk.StringVar(value=_load_lang_cfg())
+        _install_i18n_messagebox(self.lang_var)
         self.strip_calib_var = tk.BooleanVar(value=False)
         self.strip_servo_var = tk.BooleanVar(value=False)
+        self.backup_enable_var = tk.BooleanVar(value=False)
+        self.backup_name_var = tk.StringVar(value=self._default_backup_filename())
+        init_param = self.param_var.get().strip()
+        init_bdir = str(Path(init_param).parent) if init_param else str(BASE_DIR)
+        self.backup_dir_var = tk.StringVar(value=init_bdir)
+        self.backup_path_preview_var = tk.StringVar(value="")
+        self._backup_dir_custom = False
         self.skip_flash_var = tk.BooleanVar(value=False)
         self.skip_params_var = tk.BooleanVar(value=False)
         self.fw_mode_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готовий до роботи")
 
         self._build_ui()
+        self._apply_language(save=False)
+        self.param_var.trace_add("write", lambda *_: self._sync_backup_dir_from_param())
+        self.backup_dir_var.trace_add("write", lambda *_: self._update_backup_preview())
+        self._update_backup_preview()
         self.fw_var.trace_add("write", lambda *_: self._update_fw_mode_label())
         self._update_fw_mode_label()
         self.refresh_ports()
         self.root.after(100, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    @staticmethod
+    def _create_flag_ua() -> tk.PhotoImage:
+        img = tk.PhotoImage(width=20, height=14)
+        img.put("#0057B7", to=(0, 0, 20, 7))
+        img.put("#FFD700", to=(0, 7, 20, 14))
+        return img
+
+    @staticmethod
+    def _create_flag_uk() -> tk.PhotoImage:
+        img = tk.PhotoImage(width=20, height=14)
+        img.put("#012169", to=(0, 0, 20, 14))
+        for x in range(20):
+            y1 = int(round(x * 13 / 19))
+            y2 = 13 - y1
+            for dy in (-1, 0, 1):
+                if 0 <= y1 + dy < 14:
+                    img.put("#FFFFFF", to=(x, y1 + dy, x + 1, y1 + dy + 1))
+                if 0 <= y2 + dy < 14:
+                    img.put("#FFFFFF", to=(x, y2 + dy, x + 1, y2 + dy + 1))
+            img.put("#C8102E", to=(x, y1, x + 1, y1 + 1))
+            img.put("#C8102E", to=(x, y2, x + 1, y2 + 1))
+        img.put("#FFFFFF", to=(0, 5, 20, 9))
+        img.put("#FFFFFF", to=(8, 0, 12, 14))
+        img.put("#C8102E", to=(0, 6, 20, 8))
+        img.put("#C8102E", to=(9, 0, 11, 14))
+        return img
+
+    def _t(self, key: str, **kwargs) -> str:
+        lang = self.lang_var.get() if hasattr(self, "lang_var") else "ua"
+        raw = UI_TEXT.get(lang, UI_TEXT["ua"]).get(key, UI_TEXT["ua"].get(key, key))
+        return raw.format(**kwargs) if kwargs else raw
+
+    def _set_language(self, lang: str):
+        if lang in ("ua", "en") and self.lang_var.get() != lang:
+            self.lang_var.set(lang)
+            self._apply_language(save=True)
+
+    def _apply_language(self, save: bool = True):
+        lang = self.lang_var.get()
+        if save:
+            _save_lang_cfg(lang)
+        self.root.title(self._t("win_title", app=APP_NAME, ver=APP_VERSION))
+        self.frame_files.configure(text=self._t("frame_files"))
+        self.lbl_fw.configure(text=self._t("lbl_fw"))
+        self.btn_browse_fw.configure(text=self._t("btn_browse"))
+        self.lbl_param.configure(text=self._t("lbl_param"))
+        self.btn_browse_param.configure(text=self._t("btn_browse"))
+        self.frame_opts.configure(text=self._t("frame_opts"))
+        self.lbl_port.configure(text=self._t("lbl_port"))
+        self.btn_refresh_ports.configure(text=self._t("btn_refresh"))
+        self.btn_check_dfu.configure(text=self._t("btn_dfu"))
+        self.btn_unprotect_dfu.configure(text=self._t("btn_unprotect"))
+        self.chk_strip_calib.configure(text=self._t("chk_calib"))
+        self.chk_strip_servo.configure(text=self._t("chk_servo"))
+        self.chk_backup_enable.configure(text=self._t("chk_backup"))
+        self.lbl_backup_name.configure(text=self._t("lbl_backup_name"))
+        self.btn_browse_backup.configure(text=self._t("btn_folder"))
+        self.chk_skip_flash.configure(text=self._t("chk_skip_flash"))
+        self.chk_skip_params.configure(text=self._t("chk_skip_params"))
+        self.btn_prep.configure(text=self._t("btn_prep"))
+        self.btn_run.configure(text=self._t("btn_run"))
+        self.btn_stop.configure(text=self._t("btn_stop"))
+        self.btn_about.configure(text=self._t("btn_about"))
+        self.btn_clear_log.configure(text=self._t("btn_clear"))
+        self.frame_log.configure(text=self._t("frame_log"))
+        if lang == "ua":
+            self.btn_lang_ua.configure(relief="sunken", bg="#dbeafe", font=("Segoe UI", 9, "bold"))
+            self.btn_lang_en.configure(relief="raised", bg="#f3f4f6", font=("Segoe UI", 9))
+        else:
+            self.btn_lang_en.configure(relief="sunken", bg="#dbeafe", font=("Segoe UI", 9, "bold"))
+            self.btn_lang_ua.configure(relief="raised", bg="#f3f4f6", font=("Segoe UI", 9))
+        cur_port = self.port_var.get()
+        if cur_port in ("Авто", "Auto"):
+            self.port_var.set(self._t("port_auto"))
+        elif " [SLCAN / " in cur_port:
+            self.port_var.set(cur_port.replace(" [SLCAN / вторинний]", " [SLCAN / secondary]") if lang == "en" else cur_port.replace(" [SLCAN / secondary]", " [SLCAN / вторинний]"))
+        vals = list(self.port_combo["values"])
+        if vals:
+            self.port_combo["values"] = [
+                self._t("port_auto") if v in ("Авто", "Auto") else (v.replace(" [SLCAN / вторинний]", " [SLCAN / secondary]") if lang == "en" else v.replace(" [SLCAN / secondary]", " [SLCAN / вторинний]"))
+                for v in vals
+            ]
+        st = self.status_var.get()
+        self.status_var.set(self._t("status_ready") if st in ("Готовий до роботи", "Ready") else _translate_dynamic_text(st, lang))
+        self._update_fw_mode_label()
+        self._update_backup_preview()
+
     def _build_ui(self):
         pad = {"padx": 10, "pady": 5}
+        top_bar = tk.Frame(self.root)
+        top_bar.pack(fill="x", padx=10, pady=(6, 0))
+        lang_box = tk.Frame(top_bar)
+        lang_box.pack(side="right")
+        self._flag_ua_img = self._create_flag_ua()
+        self._flag_uk_img = self._create_flag_uk()
+        self.btn_lang_ua = tk.Button(lang_box, text=" UA", image=self._flag_ua_img, compound="left", padx=6, pady=1, cursor="hand2", command=lambda: self._set_language("ua"))
+        self.btn_lang_ua.pack(side="left", padx=(0, 4))
+        self.btn_lang_en = tk.Button(lang_box, text=" ENG", image=self._flag_uk_img, compound="left", padx=6, pady=1, cursor="hand2", command=lambda: self._set_language("en"))
+        self.btn_lang_en.pack(side="left")
 
-        frame_files = ttk.LabelFrame(self.root, text="Файли прошивки та параметрів", padding=10)
-        frame_files.pack(fill="x", **pad)
-        frame_files.columnconfigure(1, weight=1)
+        self.frame_files = ttk.LabelFrame(self.root, text=self._t("frame_files"), padding=10)
+        self.frame_files.pack(fill="x", **pad)
+        self.frame_files.columnconfigure(1, weight=1)
+        self.lbl_fw = ttk.Label(self.frame_files, text=self._t("lbl_fw"))
+        self.lbl_fw.grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Entry(self.frame_files, textvariable=self.fw_var).grid(row=0, column=1, sticky="ew", padx=6, pady=4)
+        self.btn_browse_fw = ttk.Button(self.frame_files, text=self._t("btn_browse"), command=self._browse_fw)
+        self.btn_browse_fw.grid(row=0, column=2, pady=4)
+        ttk.Label(self.frame_files, textvariable=self.fw_mode_var, foreground="#1f5aa6").grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self.lbl_param = ttk.Label(self.frame_files, text=self._t("lbl_param"))
+        self.lbl_param.grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Entry(self.frame_files, textvariable=self.param_var).grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        self.btn_browse_param = ttk.Button(self.frame_files, text=self._t("btn_browse"), command=self._browse_param)
+        self.btn_browse_param.grid(row=2, column=2, pady=4)
 
-        ttk.Label(frame_files, text="Прошивка (.apj / .hex / .bin):").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(frame_files, textvariable=self.fw_var).grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frame_files, text="Обрати...", command=self._browse_fw).grid(row=0, column=2, pady=4)
-
-        ttk.Label(frame_files, textvariable=self.fw_mode_var, foreground="#1f5aa6").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(0, 4)
-        )
-
-        ttk.Label(frame_files, text="Параметри (.param/.parm, опційно):").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Entry(frame_files, textvariable=self.param_var).grid(row=2, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frame_files, text="Обрати...", command=self._browse_param).grid(row=2, column=2, pady=4)
-
-        frame_opts = ttk.LabelFrame(self.root, text="Підключення та параметри заливки", padding=10)
-        frame_opts.pack(fill="x", **pad)
-        frame_opts.columnconfigure(1, weight=1)
-
-        ttk.Label(frame_opts, text="COM-порт:").grid(row=0, column=0, sticky="w", pady=4)
-        self.port_combo = ttk.Combobox(frame_opts, textvariable=self.port_var, state="readonly")
+        self.frame_opts = ttk.LabelFrame(self.root, text=self._t("frame_opts"), padding=10)
+        self.frame_opts.pack(fill="x", **pad)
+        self.frame_opts.columnconfigure(1, weight=1)
+        self.lbl_port = ttk.Label(self.frame_opts, text=self._t("lbl_port"))
+        self.lbl_port.grid(row=0, column=0, sticky="w", pady=4)
+        self.port_combo = ttk.Combobox(self.frame_opts, textvariable=self.port_var, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-
-        port_btn_box = ttk.Frame(frame_opts)
+        port_btn_box = tk.Frame(self.frame_opts)
         port_btn_box.grid(row=0, column=2, pady=4)
-        ttk.Button(port_btn_box, text="Оновити порти", command=self.refresh_ports).pack(side="left", padx=(0, 6))
-        ttk.Button(port_btn_box, text="Перевірити DFU", command=self.check_dfu_clicked).pack(side="left", padx=(0, 6))
-        ttk.Button(port_btn_box, text="Зняти захист", command=self.unprotect_dfu_clicked).pack(side="left")
+        self.btn_refresh_ports = ttk.Button(port_btn_box, text=self._t("btn_refresh"), command=self.refresh_ports)
+        self.btn_refresh_ports.pack(side="left", padx=(0, 6))
+        self.btn_check_dfu = ttk.Button(port_btn_box, text=self._t("btn_dfu"), command=self.check_dfu_clicked)
+        self.btn_check_dfu.pack(side="left", padx=(0, 6))
+        self.btn_unprotect_dfu = ttk.Button(port_btn_box, text=self._t("btn_unprotect"), command=self.unprotect_dfu_clicked)
+        self.btn_unprotect_dfu.pack(side="left")
 
-        ttk.Checkbutton(
-            frame_opts,
-            text="Вичистити калібрування датчиків (акселерометр, гіроскоп, компас — для серії бортів)",
-            variable=self.strip_calib_var,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=2)
-
-        ttk.Checkbutton(
-            frame_opts,
-            text="Не перезаписувати налаштування сервоприводів (ігнорувати всі SERVO*)",
-            variable=self.strip_servo_var,
-        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
-
-        ttk.Checkbutton(
-            frame_opts,
-            text="Тільки підготувати й залити параметри (пропустити прошивку .apj / .hex)",
-            variable=self.skip_flash_var,
-            command=self._on_skip_flash_toggle,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
-
-        ttk.Checkbutton(
-            frame_opts,
-            text="Тільки прошити контролер (пропустити підготовку й заливку параметрів)",
-            variable=self.skip_params_var,
-            command=self._on_skip_params_toggle,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+        self.chk_strip_calib = ttk.Checkbutton(self.frame_opts, text=self._t("chk_calib"), variable=self.strip_calib_var)
+        self.chk_strip_calib.grid(row=1, column=0, columnspan=3, sticky="w", pady=2)
+        self.chk_strip_servo = ttk.Checkbutton(self.frame_opts, text=self._t("chk_servo"), variable=self.strip_servo_var)
+        self.chk_strip_servo.grid(row=2, column=0, columnspan=3, sticky="w", pady=2)
+        self.chk_backup_enable = ttk.Checkbutton(self.frame_opts, text=self._t("chk_backup"), variable=self.backup_enable_var, command=self._on_backup_toggle)
+        self.chk_backup_enable.grid(row=3, column=0, columnspan=3, sticky="w", pady=2)
+        self.lbl_backup_name = ttk.Label(self.frame_opts, text=self._t("lbl_backup_name"))
+        self.lbl_backup_name.grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Entry(self.frame_opts, textvariable=self.backup_name_var).grid(row=4, column=1, sticky="ew", padx=6, pady=2)
+        self.btn_browse_backup = ttk.Button(self.frame_opts, text=self._t("btn_folder"), command=self._browse_backup_dir)
+        self.btn_browse_backup.grid(row=4, column=2, sticky="w", pady=2)
+        ttk.Label(self.frame_opts, textvariable=self.backup_path_preview_var, foreground="#4a5568").grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        self.chk_skip_flash = ttk.Checkbutton(self.frame_opts, text=self._t("chk_skip_flash"), variable=self.skip_flash_var, command=self._on_skip_flash_toggle)
+        self.chk_skip_flash.grid(row=6, column=0, columnspan=3, sticky="w", pady=2)
+        self.chk_skip_params = ttk.Checkbutton(self.frame_opts, text=self._t("chk_skip_params"), variable=self.skip_params_var, command=self._on_skip_params_toggle)
+        self.chk_skip_params.grid(row=7, column=0, columnspan=3, sticky="w", pady=2)
 
         frame_btns = ttk.Frame(self.root)
         frame_btns.pack(fill="x", padx=10, pady=6)
-
-        self.btn_prep = ttk.Button(frame_btns, text="Тільки підготувати параметри", command=self.start_prepare_only)
+        self.btn_prep = ttk.Button(frame_btns, text=self._t("btn_prep"), command=self.start_prepare_only)
         self.btn_prep.pack(side="left", padx=(0, 8))
-
-        self.btn_run = ttk.Button(frame_btns, text="Підготувати та прошити", command=self.start_full_process)
+        self.btn_run = ttk.Button(frame_btns, text=self._t("btn_run"), command=self.start_full_process)
         self.btn_run.pack(side="left", padx=(0, 8))
-
-        self.btn_stop = ttk.Button(frame_btns, text="Зупинити", command=self.stop_process, state="disabled")
+        self.btn_stop = ttk.Button(frame_btns, text=self._t("btn_stop"), command=self.stop_process, state="disabled")
         self.btn_stop.pack(side="left")
-
-        ttk.Button(frame_btns, text="Про програму", command=self._show_about).pack(side="right", padx=(6, 0))
-        ttk.Button(frame_btns, text="Очистити лог", command=self._clear_log).pack(side="right")
+        self.btn_about = ttk.Button(frame_btns, text=self._t("btn_about"), command=self._show_about)
+        self.btn_about.pack(side="right", padx=(6, 0))
+        self.btn_clear_log = ttk.Button(frame_btns, text=self._t("btn_clear"), command=self._clear_log)
+        self.btn_clear_log.pack(side="right")
 
         frame_prog = ttk.Frame(self.root)
         frame_prog.pack(fill="x", padx=10, pady=(2, 6))
@@ -428,45 +707,29 @@ class BittecFlasherGUI:
         self.progress.pack(fill="x")
         ttk.Label(frame_prog, textvariable=self.status_var).pack(anchor="w", pady=(3, 0))
 
-        frame_log = ttk.LabelFrame(self.root, text="Журнал виконання", padding=6)
-        frame_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.log_box = scrolledtext.ScrolledText(frame_log, state="disabled", font=("Consolas", 9), wrap="word")
+        self.frame_log = ttk.LabelFrame(self.root, text=self._t("frame_log"), padding=6)
+        self.frame_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.log_box = scrolledtext.ScrolledText(self.frame_log, state="disabled", font=("Consolas", 9), wrap="word")
         self.log_box.pack(fill="both", expand=True)
 
     def _update_fw_mode_label(self):
         fw_str = self.fw_var.get().strip()
         if not fw_str:
-            self.fw_mode_var.set("Режим прошивки: оберіть .apj (оновлення ArduPilot) або *_with_bl.hex (первинна прошивка DFU)")
+            self.fw_mode_var.set(self._t("fw_empty"))
             return
         ext = Path(fw_str).suffix.lower()
         if ext == ".apj":
-            self.fw_mode_var.set("Режим прошивки: ArduPilot Bootloader (.apj) — для Pixhawk 6C, Matek H743 та інших плат з ArduPilot")
+            self.fw_mode_var.set(self._t("fw_apj"))
         elif ext in (".hex", ".bin"):
-            self.fw_mode_var.set("Режим прошивки: STM32 DFU (.hex / .bin) — первинна прошивка через кнопку BOOT (Matek H743 тощо)")
+            self.fw_mode_var.set(self._t("fw_dfu"))
         else:
-            self.fw_mode_var.set(f"Непідтримуваний формат файлу ({ext}). Оберіть .apj, .hex або .bin.")
+            self.fw_mode_var.set(self._t("fw_bad", ext=ext))
 
     def _show_about(self):
         dfu_path = find_dfu_util()
-        dfu_state = "вшито" if dfu_path else "не знайдено"
-        info = (
-            f"{APP_NAME} v{APP_VERSION}\n"
-            f"{APP_COPYRIGHT}\n"
-            f"GitHub: {APP_REPO}\n"
-            "Ліцензія: GNU GPLv3\n\n"
-            "Незалежна утиліта для автоматичного очищення параметрів,\n"
-            "прошивки (.apj та STM32 DFU .hex/.bin) і двопрохідної заливки\n"
-            "параметрів MAVLink для контролерів ArduPilot (Pixhawk 6C, Matek H743 тощо).\n\n"
-            "Використані відкриті компоненти:\n"
-            "• pymavlink (LGPLv3)\n"
-            "• uploader.py — PX4 / ArduPilot (BSD-3-Clause / GPLv3)\n"
-            f"• dfu-util ({dfu_state}, GPLv2+) та libusb (LGPLv2.1+)\n"
-            "• pyserial, lxml (BSD-3-Clause), fastcrc (MIT)\n\n"
-            "УВАГА: ПЗ надається «як є» (AS IS) без жодних гарантій.\n"
-            "Перед прошивкою обов'язково знімайте пропелери та від'єднуйте\n"
-            "силовий акумулятор."
-        )
-        messagebox.showinfo(f"Про {APP_NAME}", info)
+        dfu_state = self._t("dfu_embedded") if dfu_path else self._t("dfu_missing")
+        info = self._t("about_body", app=APP_NAME, ver=APP_VERSION, copy=APP_COPYRIGHT, repo=APP_REPO, dfu=dfu_state)
+        messagebox.showinfo(self._t("about_title", app=APP_NAME), info)
 
     def _browse_fw(self):
         p = filedialog.askopenfilename(
@@ -722,6 +985,76 @@ class BittecFlasherGUI:
         if self.skip_params_var.get():
             self.skip_flash_var.set(False)
 
+    @staticmethod
+    def _default_backup_filename() -> str:
+        return time.strftime("backup_%Y%m%d_%H%M%S.param")
+
+    def _on_backup_toggle(self):
+        if self.backup_enable_var.get():
+            cur = self.backup_name_var.get().strip()
+            if not cur or re.fullmatch(r"backup_\d{8}_\d{6}\.param", cur, re.IGNORECASE):
+                self.backup_name_var.set(self._default_backup_filename())
+        self._update_backup_preview()
+
+    def _sync_backup_dir_from_param(self):
+        if self._backup_dir_custom:
+            return
+        raw = self.param_var.get().strip()
+        if raw:
+            p = Path(raw)
+            parent = p.parent if p.suffix else p
+            if str(parent) and str(parent) != ".":
+                self.backup_dir_var.set(str(parent))
+
+    def _browse_backup_dir(self):
+        initial = self.backup_dir_var.get().strip() or str(BASE_DIR)
+        chosen = filedialog.askdirectory(title="Оберіть базову папку для резервних копій", initialdir=initial)
+        if chosen:
+            self._backup_dir_custom = True
+            self.backup_dir_var.set(chosen)
+
+    def _update_backup_preview(self):
+        base = self.backup_dir_var.get().strip() or str(BASE_DIR)
+        dated_dir = Path(base) / f"backup_{time.strftime('%Y-%m-%d')}"
+        self.backup_path_preview_var.set(self._t("backup_preview", path=dated_dir))
+
+    def _save_backup_params(
+        self,
+        params: dict[str, tuple[float, int]],
+        base_dir_str: str,
+        raw_filename: str,
+        param_path: Path | None,
+    ) -> Path:
+        if base_dir_str.strip():
+            base_dir = Path(base_dir_str.strip())
+        elif param_path is not None:
+            base_dir = param_path.parent
+        else:
+            base_dir = BASE_DIR
+        dated_dir = base_dir / f"backup_{time.strftime('%Y-%m-%d')}"
+        dated_dir.mkdir(parents=True, exist_ok=True)
+        clean_name = re.sub(r'[<>:"/\\|?*]', "_", raw_filename.strip())
+        if not clean_name:
+            clean_name = self._default_backup_filename()
+        if not clean_name.lower().endswith((".param", ".parm")):
+            clean_name += ".param"
+        out_path = dated_dir / clean_name
+        lines = [
+            f"# Backup created by Bittec Flasher on {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Parameters count: {len(params)}",
+        ]
+        for name in sorted(params.keys()):
+            val, ptype = params[name]
+            if math.isfinite(val) and float(val).is_integer() and abs(val) < 1e12 and ptype in (1, 2, 3, 4, 5, 6):
+                val_str = str(int(round(val)))
+            else:
+                val_str = f"{val:.6f}".rstrip("0").rstrip(".") or "0"
+                if val_str == "-0":
+                    val_str = "0"
+            lines.append(f"{name},{val_str}")
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return out_path
+
     def _ask_unprotect_on_lock(self) -> bool:
         ev = threading.Event()
         res_box = {"unprotect": False}
@@ -779,7 +1112,17 @@ class BittecFlasherGUI:
         self._set_running(True)
         self.worker = threading.Thread(
             target=self._run_full_pipeline,
-            args=(fw_path, param_path, self._get_selected_port(), self.strip_calib_var.get(), skip_flash, self.strip_servo_var.get()),
+            args=(
+                fw_path,
+                param_path,
+                self._get_selected_port(),
+                self.strip_calib_var.get(),
+                skip_flash,
+                self.strip_servo_var.get(),
+                self.backup_enable_var.get(),
+                self.backup_dir_var.get(),
+                self.backup_name_var.get(),
+            ),
             daemon=True,
         )
         self.worker.start()
@@ -1000,17 +1343,132 @@ class BittecFlasherGUI:
         self.active_proc = None
         return rc, lines
 
+    @staticmethod
+    def _is_bootloader_port(port_info) -> bool:
+        desc = f"{port_info.description or ''} {port_info.hwid or ''}".lower()
+        return bool(re.search(r"\bbl\b|bootloader", desc))
+
+    def _try_reboot_to_bootloader(self, explicit_port: str | None) -> str | None:
+        ports = sorted(serial.tools.list_ports.comports(), key=rank_port)
+        if explicit_port:
+            candidates = [explicit_port]
+        else:
+            candidates = [p.device for p in ports if rank_port(p) <= 1]
+        if not candidates:
+            return None
+
+        old_devices = {p.device for p in ports}
+        for dev in candidates:
+            if self.stop_event.is_set():
+                raise InterruptedError("Прошивку зупинено користувачем")
+            conn = None
+            try:
+                conn = mavutil.mavlink_connection(dev, baud=115200)
+                hb = conn.wait_heartbeat(timeout=2.5)
+                if not hb:
+                    continue
+                self.log(f"[FLASH .apj] Знайдено MAVLink на {dev} — переведення в завантажувач (param1=3)...")
+                conn.mav.command_long_send(
+                    conn.target_system,
+                    conn.target_component,
+                    mavutil.mavlink.MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN,
+                    0,
+                    3, 0, 0, 0, 0, 0, 0,
+                )
+                time.sleep(0.3)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+
+                deadline = time.time() + 7.0
+                saw_disconnect = False
+                while time.time() < deadline:
+                    if self.stop_event.is_set():
+                        raise InterruptedError("Прошивку зупинено користувачем")
+                    cur_ports = sorted(serial.tools.list_ports.comports(), key=rank_port)
+                    cur_usb = [p for p in cur_ports if rank_port(p) <= 1]
+                    cur_devs = {p.device for p in cur_usb}
+                    if dev not in cur_devs:
+                        saw_disconnect = True
+                    bl_ports = [p for p in cur_usb if self._is_bootloader_port(p)]
+                    if bl_ports:
+                        time.sleep(0.25)
+                        return bl_ports[0].device
+                    new_ports = [p for p in cur_usb if p.device not in old_devices]
+                    if new_ports:
+                        time.sleep(0.25)
+                        return new_ports[0].device
+                    if saw_disconnect and cur_usb:
+                        time.sleep(0.25)
+                        return cur_usb[0].device
+                    time.sleep(0.15)
+                return None
+            except InterruptedError:
+                raise
+            except Exception:
+                pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        return None
+
+    def _wait_for_flash_port(self, explicit_port: str | None, timeout_sec: float = 60.0) -> str | None:
+        ports = sorted(serial.tools.list_ports.comports(), key=rank_port)
+        usb_ports = [p for p in ports if rank_port(p) <= 1 or (explicit_port and p.device == explicit_port)]
+        for p in usb_ports:
+            if self._is_bootloader_port(p):
+                return p.device
+
+        bl_port = self._try_reboot_to_bootloader(explicit_port)
+        if bl_port:
+            return bl_port
+
+        baseline = {p.device for p in serial.tools.list_ports.comports() if rank_port(p) <= 1}
+        self.log("[FLASH .apj] Підключіть або перепідключіть кабель USB контролера...")
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if self.stop_event.is_set():
+                raise InterruptedError("Прошивку зупинено користувачем")
+            cur_ports = sorted(serial.tools.list_ports.comports(), key=rank_port)
+            cur_usb = [p for p in cur_ports if rank_port(p) <= 1 or (explicit_port and p.device == explicit_port)]
+            cur_devs = {p.device for p in cur_usb}
+            baseline = baseline & cur_devs
+
+            bl_ports = [p for p in cur_usb if self._is_bootloader_port(p)]
+            if bl_ports:
+                time.sleep(0.2)
+                return bl_ports[0].device
+
+            arrived = [p for p in cur_usb if p.device not in baseline]
+            if arrived:
+                time.sleep(0.25)
+                cur_ports2 = sorted(serial.tools.list_ports.comports(), key=rank_port)
+                cur_usb2 = [p for p in cur_ports2 if rank_port(p) <= 1 or (explicit_port and p.device == explicit_port)]
+                arrived2 = [p for p in cur_usb2 if p.device not in baseline]
+                if arrived2:
+                    return arrived2[0].device
+                return arrived[0].device
+            time.sleep(0.15)
+        return explicit_port
+
     def _run_uploader(self, fw_path: Path, explicit_port: str | None):
+        self.log(f"[FLASH .apj] Пошук порту завантажувача для {fw_path.name}...")
+        target_port = self._wait_for_flash_port(explicit_port)
+        if target_port:
+            self.log(f"[FLASH .apj] Вибрано порт завантажувача: {target_port}")
+
         if getattr(sys, "frozen", False):
             cmd = [sys.executable, "--run-uploader"]
         else:
             cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--run-uploader"]
-        if explicit_port:
-            cmd += ["--port", explicit_port]
+        if target_port:
+            cmd += ["--port", target_port]
         cmd.append(str(fw_path))
-
-        self.log(f"[FLASH .apj] Запуск вбудованого завантажувача для {fw_path.name}...")
-        self.log("[FLASH .apj] Підключіть контролер (Pixhawk 6C / Matek H743) до USB або перепідключіть кабель.")
 
         rc, _ = self._stream_process(cmd, BASE_DIR)
         if self.stop_event.is_set():
@@ -1094,6 +1552,9 @@ class BittecFlasherGUI:
         strip_calib: bool,
         skip_flash: bool,
         strip_servo: bool = False,
+        backup_enable: bool = False,
+        backup_dir: str = "",
+        backup_name: str = "",
     ):
         try:
             target_params: dict[str, float] | None = None
@@ -1106,6 +1567,31 @@ class BittecFlasherGUI:
                     self.log(f"Виключено налаштувань сервоприводів (SERVO*): {len(removed_servo)}")
             else:
                 self.log("[PARAMS] Файл параметрів не вказано — буде виконано лише прошивку.")
+
+            preloaded_conn = None
+            preloaded_params = None
+            if backup_enable and target_params is not None:
+                self.set_progress(18, "Створення резервної копії параметрів...")
+                if skip_flash:
+                    preloaded_conn = self._connect_mavlink(explicit_port)
+                    preloaded_params = self._download_params(preloaded_conn)
+                    saved_bkp = self._save_backup_params(preloaded_params, backup_dir, backup_name, param_path)
+                    self.log(f"[BACKUP] Резервну копію ({len(preloaded_params)} пар.) збережено: {saved_bkp}")
+                else:
+                    bkp_conn = None
+                    try:
+                        bkp_conn = self._connect_mavlink(explicit_port, timeout_total=10)
+                        bkp_params = self._download_params(bkp_conn)
+                        saved_bkp = self._save_backup_params(bkp_params, backup_dir, backup_name, param_path)
+                        self.log(f"[BACKUP] Резервну копію перед прошивкою ({len(bkp_params)} пар.) збережено: {saved_bkp}")
+                    except RuntimeError:
+                        self.log("[BACKUP] Контролер не відповідає по MAVLink перед прошивкою (можливо, вже в режимі DFU/BOOT) — бекап пропущено.")
+                    finally:
+                        if bkp_conn is not None:
+                            try:
+                                bkp_conn.close()
+                            except Exception:
+                                pass
 
             if not skip_flash and fw_path is not None:
                 is_dfu = fw_path.suffix.lower() in (".hex", ".bin")
@@ -1150,9 +1636,12 @@ class BittecFlasherGUI:
                         conn = self._connect_mavlink(explicit_port, timeout_total=45)
                     except RuntimeError:
                         self.log("[MAVLink] Порт досі не знайдено. Перевірте кабель і спробуйте ще раз.")
+            elif preloaded_conn is not None and preloaded_params is not None:
+                conn = preloaded_conn
+                cur1 = preloaded_params
             else:
                 conn = self._connect_mavlink(explicit_port)
-            cur1 = self._download_params(conn)
+                cur1 = self._download_params(conn)
             w1, s1, m1, f1 = self._write_pass(conn, target_params, cur1)
             self.log(f"[Прохід 1] Записано: {w1}, вже збігались: {s1}, ще відсутні: {len(m1)}, помилок: {len(f1)}")
             self._reboot_fc(conn, wait_sec=9)
